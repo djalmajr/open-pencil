@@ -3,5 +3,27 @@
     "commit": "",
     "pr": "",
     "sessionUrl": false
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'command -v soho >/dev/null 2>&1 || exit 0; exec soho hook reminder'"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'command -v soho >/dev/null 2>&1 || exit 0; exec soho hook doctor'"
+          }
+        ]
+      }
+    ]
   }
 }
