@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'command -v soho \u003e/dev/null 2\u003e\u00261 || exit 0; exec soho hook reminder --codex'",
+            "commandWindows": "soho hook reminder --codex"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'command -v soho \u003e/dev/null 2\u003e\u00261 || exit 0; exec soho hook doctor --codex'",
+            "commandWindows": "soho hook doctor --codex"
+          }
+        ]
+      }
+    ]
+  }
+}
