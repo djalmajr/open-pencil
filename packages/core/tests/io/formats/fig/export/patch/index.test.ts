@@ -17,14 +17,23 @@ import {
   populateAllFigPages,
   populateFigPage
 } from '@open-pencil/core/io/formats/fig'
-import type { NodeChange } from '@open-pencil/kiwi/fig/codec'
-import type { SceneGraph } from '@open-pencil/scene-graph'
+import { patchFigArchive, readStreamBytes } from '@open-pencil/fig'
+import { initCodec, type NodeChange } from '@open-pencil/kiwi/fig/codec'
+import { SceneGraph } from '@open-pencil/scene-graph'
 import { cloneNodeProps } from '@open-pencil/scene-graph/copy'
 import { expectDefined } from '@open-pencil/test-support/assert'
 
+import { parseFigFileViaWorker } from '#core/io/formats/fig/read'
+import {
+  createFigPopulationWorker,
+  releaseFigPopulationWorker
+} from '#core/kiwi/fig/population/client'
+import { archiveBaseline } from '#core/kiwi/fig/session/archive/changes'
 import {
   hasPendingReaderPages,
-  populateFigInternalPages
+  isReaderPagePending,
+  populateFigInternalPages,
+  readerCheckpoint
 } from '#core/kiwi/fig/session/document-state'
 
 setDefaultTimeout(60_000)
@@ -75,6 +84,308 @@ describe('writing an edited document into its archive', () => {
     const after = recordsOf(await exportFigFile(graph))
     const changed = [...after].filter(([guid, record]) => !isEqual(before.get(guid), record))
     expect(changed.map(([, record]) => record.name)).toEqual(['B renamed'])
+  })
+
+  test('preserves unrelated archive fields while component use pages stay pending', async () => {
+    const bytes = await fixtureBytes()
+    const variable = [...recordsOf(bytes).values()].find((record) => record.name === 'brand')
+    if (!variable) throw new Error('Expected brand variable')
+    const annotated = await readStreamBytes(
+      patchFigArchive(
+        bytes.slice().buffer,
+        {
+          records: [{ ...variable, sortPosition: 'preserved-order', isSoftDeleted: false }],
+          blobs: [],
+          removed: [],
+          replaceVariables: false
+        },
+        { thumbnailPNG: new Uint8Array(), metaJSON: '{}', images: [] }
+      )
+    )
+    const before = [...recordsOf(annotated).values()].find((record) => record.name === 'brand')
+    expect(before?.sortPosition).toBe('preserved-order')
+
+    const results: Array<{
+      scenario: string
+      sortPosition: unknown
+      pending: boolean
+      pendingAfter: boolean
+      usedPending: boolean
+      usedPendingAfter: boolean
+      nodeCount: number
+      nodeCountAfter: number
+      renamed: boolean
+    }> = []
+    for (const scenario of [
+      'pending-use-page',
+      'pending-unrelated-page',
+      'no-pending-pages',
+      'non-component-edit'
+    ] as const) {
+      const graph = await open(annotated)
+      const library = pageNamed(graph, 'Library')
+      const used = pageNamed(graph, 'Used')
+      if (scenario !== 'non-component-edit') populateFigPage(graph, library.id)
+      if (scenario === 'pending-unrelated-page') populateFigPage(graph, used.id)
+      if (scenario === 'no-pending-pages') {
+        populateAllFigPages(graph)
+        populateFigInternalPages(graph)
+      }
+      const pending = hasPendingReaderPages(graph)
+      const usedPending = isReaderPagePending(graph, used.id)
+      const nodeCount = graph.nodes.size
+      const layer = layerNamed(graph, scenario === 'non-component-edit' ? 'B' : 'Card')
+      graph.updateNode(layer.id, { name: 'Renamed' })
+
+      const records = [...recordsOf(await exportFigFile(graph)).values()]
+      results.push({
+        scenario,
+        sortPosition: records.find((record) => record.name === 'brand')?.sortPosition,
+        pending,
+        pendingAfter: hasPendingReaderPages(graph),
+        usedPending,
+        usedPendingAfter: isReaderPagePending(graph, used.id),
+        nodeCount,
+        nodeCountAfter: graph.nodes.size,
+        renamed: records.some((record) => record.name === 'Renamed')
+      })
+    }
+    for (const result of results) {
+      expect(result.renamed, result.scenario).toBe(true)
+      expect(result.sortPosition, result.scenario).toBe('preserved-order')
+      expect(result.pendingAfter, result.scenario).toBe(result.pending)
+      expect(result.usedPendingAfter, result.scenario).toBe(result.usedPending)
+      expect(result.nodeCountAfter, result.scenario).toBe(result.nodeCount)
+    }
+  })
+
+  test.each([
+    'loaded-first-page',
+    'pending-use-page',
+    'pending-unrelated-page',
+    'acyclic-control',
+    'page-loading-in-worker'
+  ] as const)('saves a repaired component loop on the %s', async (location) => {
+    await initCodec()
+    const source = new SceneGraph()
+    const [cover] = source.getPages()
+    const card = source.createNode('COMPONENT', cover.id, { name: 'Card', width: 20, height: 20 })
+    const leaf = source.createNode('COMPONENT', cover.id, { name: 'Leaf', width: 20, height: 20 })
+    const used = source.addPage('Used')
+    source.createInstance(card.id, used.id, { name: 'Card use' })
+    const elsewhere = source.addPage('Elsewhere')
+    let page = used
+    if (location === 'loaded-first-page') page = cover
+    if (location === 'pending-unrelated-page') page = elsewhere
+    const loop = source.createNode('COMPONENT', page.id, { name: 'Loop', width: 20, height: 20 })
+    source.createInstance(leaf.id, loop.id, { name: 'Nested loop slot' })
+    const pristine = await exportFigFile(source)
+    const original = recordsOf(pristine)
+    const container = [...original.values()].find((record) => record.name === 'Loop')
+    const nested = [...original.values()].find((record) => record.name === 'Nested loop slot')
+    if (!container?.guid || !nested?.guid || !nested.symbolData)
+      throw new Error('Missing loop records')
+    const nestedId = guidKey(nested)
+    const hasCycle = location !== 'acyclic-control'
+    const bytes = hasCycle
+      ? await readStreamBytes(
+          patchFigArchive(
+            pristine.slice().buffer,
+            {
+              records: [
+                { ...nested, symbolData: { ...nested.symbolData, symbolID: container.guid } }
+              ],
+              blobs: [],
+              removed: [],
+              replaceVariables: false
+            },
+            { thumbnailPNG: new Uint8Array(), metaJSON: '{}', images: [] }
+          )
+        )
+      : pristine
+    if (location === 'page-loading-in-worker') {
+      const graph = await parseFigFileViaWorker(bytes.slice().buffer, { populate: 'first-page' })
+      try {
+        const worker = expectDefined(createFigPopulationWorker(graph))
+        const usePage = pageNamed(graph, 'Used')
+        expect(isReaderPagePending(graph, usePage.id)).toBe(true)
+        const loading = worker.populate(usePage.id)
+        expect(readerCheckpoint(graph)?.droppedRecordIds).not.toContain(nestedId)
+
+        const saved = recordsOf(await exportFigFile(graph))
+
+        expect(await loading).toBe(true)
+        expect(readerCheckpoint(graph)?.droppedRecordIds).toContain(nestedId)
+        expect(saved.has(nestedId)).toBe(false)
+      } finally {
+        releaseFigPopulationWorker(graph)
+      }
+      return
+    }
+    const graph = await open(bytes)
+    const usePage = pageNamed(graph, 'Used')
+    expect(isReaderPagePending(graph, usePage.id)).toBe(true)
+    graph.updateNode(layerNamed(graph, 'Card').id, { name: 'Renamed card' })
+    const saved = recordsOf(await exportFigFile(graph))
+    expect([...saved.values()].some((record) => record.name === 'Renamed card')).toBe(true)
+    expect(saved.has(nestedId)).toBe(!hasCycle || location === 'pending-unrelated-page')
+    expect(isReaderPagePending(graph, usePage.id)).toBe(true)
+  })
+
+  for (const reader of ['local', 'worker'] as const) {
+    for (const scenario of [
+      'same-pending-page',
+      'unrelated-pending-page',
+      'same-loaded-page',
+      'same-internal-page'
+    ] as const) {
+      test(`does not resurrect a deleted component: ${reader}, ${scenario}`, async () => {
+        await initCodec()
+        const source = new SceneGraph()
+        const [cover] = source.getPages()
+        const library =
+          scenario === 'same-internal-page'
+            ? source.createNode('CANVAS', source.rootId, {
+                name: 'Internal library',
+                internalOnly: true
+              })
+            : source.addPage('Library')
+        const uses = source.addPage('Uses')
+        const others = source.addPage('Other uses')
+        const card = source.createNode(
+          'COMPONENT',
+          scenario === 'same-internal-page' ? library.id : cover.id,
+          { name: 'Card' }
+        )
+        const obsolete = source.createNode('COMPONENT', library.id, { name: 'Obsolete' })
+        source.createNode('RECTANGLE', obsolete.id, { name: 'Obsolete body' })
+        source.createInstance(card.id, uses.id, { name: 'Card instance' })
+        source.createInstance(
+          obsolete.id,
+          scenario === 'unrelated-pending-page' ? others.id : uses.id,
+          { name: 'Obsolete instance' }
+        )
+        const input = await exportFigFile(source)
+        const original = recordsOf(input)
+        const obsoleteGuid = [...original].find(([, record]) => record.name === 'Obsolete')?.[0]
+        const bodyGuid = [...original].find(([, record]) => record.name === 'Obsolete body')?.[0]
+        const cardGuid = [...original].find(([, record]) => record.name === 'Card')?.[0]
+        if (!obsoleteGuid || !bodyGuid || !cardGuid) throw new Error('Missing component records')
+        const graph =
+          reader === 'worker'
+            ? await parseFigFileViaWorker(input.slice().buffer, { populate: 'first-page' })
+            : await open(input)
+        try {
+          const worker = reader === 'worker' ? createFigPopulationWorker(graph) : null
+          if (reader === 'worker' && !worker) throw new Error('Expected population worker')
+          const populate = async (id: string) =>
+            worker ? await worker.populate(id) : populateFigPage(graph, id)
+          const libraryPage = graph
+            .getPages(true)
+            .find(
+              (page) =>
+                page.name === (scenario === 'same-internal-page' ? 'Internal library' : 'Library')
+            )
+          if (!libraryPage) throw new Error('Missing library page')
+          expect(await populate(libraryPage.id)).toBe(true)
+          const usePage = pageNamed(graph, 'Uses')
+          if (scenario === 'same-loaded-page') expect(await populate(usePage.id)).toBe(true)
+          expect(isReaderPagePending(graph, usePage.id)).toBe(scenario !== 'same-loaded-page')
+          graph.updateNode(layerNamed(graph, 'Card').id, { name: 'Edited card' })
+          graph.deleteNode(layerNamed(graph, 'Obsolete').id)
+          const before = [...graph.nodes.keys()]
+          const records = recordsOf(await exportFigFile(graph))
+          expect(records.get(cardGuid)?.name).toBe('Edited card')
+          expect([...graph.nodes.keys()]).toEqual(before)
+          expect(isReaderPagePending(graph, usePage.id)).toBe(scenario !== 'same-loaded-page')
+          expect(records.has(obsoleteGuid)).toBe(false)
+          expect(records.has(bodyGuid)).toBe(false)
+          expect([...records.values()].some((record) => record.name === 'Obsolete body')).toBe(
+            false
+          )
+        } finally {
+          releaseFigPopulationWorker(graph)
+        }
+      })
+    }
+  }
+
+  test.each([true, false])(
+    'saves an edited component after another loaded component was deleted (internal page: %s)',
+    async (withInternalPage) => {
+      await initCodec()
+      const source = new SceneGraph()
+      const [cover] = source.getPages()
+      const library = source.addPage('Library')
+      const card = source.createNode('COMPONENT', cover.id, { name: 'Public card' })
+      const obsolete = source.createNode('COMPONENT', library.id, { name: 'Obsolete asset' })
+      source.createNode('RECTANGLE', obsolete.id, { name: 'Obsolete child' })
+      const used = source.addPage('Used')
+      source.createInstance(card.id, used.id, { name: 'First use' })
+      const usedAgain = source.addPage('Used again')
+      source.createInstance(card.id, usedAgain.id, { name: 'Second use' })
+      if (withInternalPage) {
+        const internal = source.createNode('CANVAS', source.rootId, {
+          name: 'Internal dependencies',
+          internalOnly: true
+        })
+        source.createInstance(obsolete.id, internal.id, { name: 'Archived internal use' })
+      }
+      const bytes = await exportFigFile(source)
+      const graph = await open(bytes)
+      populateFigPage(graph, pageNamed(graph, 'Library').id)
+      const usePage = pageNamed(graph, 'Used')
+      const secondUsePage = pageNamed(graph, 'Used again')
+      const internalPage = graph.getPages(true).find((page) => page.internalOnly)
+      if (withInternalPage && !internalPage) throw new Error('Missing internal page')
+      expect(isReaderPagePending(graph, usePage.id)).toBe(true)
+      expect(isReaderPagePending(graph, secondUsePage.id)).toBe(true)
+      if (internalPage) expect(isReaderPagePending(graph, internalPage.id)).toBe(true)
+      const edited = layerNamed(graph, 'Public card')
+      const deleted = layerNamed(graph, 'Obsolete asset')
+      const deletedSourceId = expectDefined(
+        [...recordsOf(bytes)].find(([, record]) => record.name === 'Obsolete asset')
+      )[0]
+      graph.updateNode(edited.id, { name: 'Renamed public card' })
+      graph.deleteNode(deleted.id)
+      const nodesBefore = [...graph.nodes.keys()]
+      const records = recordsOf(await exportFigFile(graph))
+      expect([...records.values()].some((record) => record.name === 'Renamed public card')).toBe(
+        true
+      )
+      expect([...records.values()].some((record) => record.name === 'Obsolete asset')).toBe(false)
+      expect(records.has(deletedSourceId)).toBe(false)
+      for (const name of [
+        'First use',
+        'Second use',
+        ...(withInternalPage ? ['Archived internal use'] : [])
+      ]) {
+        const original = [...recordsOf(bytes)].find(([, record]) => record.name === name)
+        if (!original) throw new Error(`Missing original record ${name}`)
+        expect(records.has(original[0])).toBe(true)
+      }
+      expect([...graph.nodes.keys()]).toEqual(nodesBefore)
+      expect(isReaderPagePending(graph, usePage.id)).toBe(true)
+      expect(isReaderPagePending(graph, secondUsePage.id)).toBe(true)
+      if (internalPage) expect(isReaderPagePending(graph, internalPage.id)).toBe(true)
+    }
+  )
+
+  test('exporting pending component uses does not change the live archive edit accounting', async () => {
+    const graph = await open(await fixtureBytes())
+    const used = pageNamed(graph, 'Used')
+    populateFigPage(graph, pageNamed(graph, 'Library').id)
+    graph.updateNode(layerNamed(graph, 'Card').id, { name: 'Renamed card' })
+    populateFigPage(graph, pageNamed(graph, 'Bound').id)
+    const before = structuredClone(expectDefined(archiveBaseline(graph)))
+    expect(before.loadedAfterEdits.size).toBeGreaterThan(0)
+    expect(isReaderPagePending(graph, used.id)).toBe(true)
+    const output = await exportFigFile(graph)
+    expect([...recordsOf(output).values()].some((record) => record.name === 'Renamed card')).toBe(
+      true
+    )
+    expect(archiveBaseline(graph)).toEqual(before)
+    expect(isReaderPagePending(graph, used.id)).toBe(true)
   })
 
   const edits: Array<[string, (graph: SceneGraph) => void]> = [

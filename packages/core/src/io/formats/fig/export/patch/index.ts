@@ -35,15 +35,17 @@ import {
   prepareFigExport
 } from '#core/io/formats/fig/export/setup'
 import { appendVariableNodeChanges } from '#core/io/formats/fig/export/variables'
+import { cloneSceneGraphForFigExport } from '#core/kiwi/fig/parse/transfer'
 import { figArchive, type FigArchiveAccess } from '#core/kiwi/fig/session/archive/access'
 import {
   archiveBaseline,
   archiveChanges,
-  type ArchiveChangeSummary
+  type ArchiveChangeSummary,
+  copyArchiveChanges
 } from '#core/kiwi/fig/session/archive/changes'
 import {
   isReaderPagePending,
-  populateFigPage,
+  populateReaderExport,
   readerCheckpoint
 } from '#core/kiwi/fig/session/document-state'
 
@@ -95,6 +97,8 @@ interface ArchiveRecords {
   byNode: ReadonlyMap<string, string>
   /** Records a component loop repair left out, which have no layer to keep them. */
   dropped: readonly string[]
+  /** Records deleted from the live graph before export-only pages were loaded. */
+  deleted: ReadonlySet<string>
 }
 
 function archiveRecords(graph: SceneGraph): ArchiveRecords | null {
@@ -104,7 +108,8 @@ function archiveRecords(graph: SceneGraph): ArchiveRecords | null {
   return {
     byGuid,
     byNode: new Map([...byGuid].map(([guid, nodeId]) => [nodeId, guid])),
-    dropped: checkpoint.droppedRecordIds ?? []
+    dropped: checkpoint.droppedRecordIds ?? [],
+    deleted: new Set()
   }
 }
 
@@ -273,6 +278,7 @@ function planRecords(
   const records = new Set<string>()
   const add = (id: string) => {
     const owner = recordOwner(graph, id)
+    if (owner && archived.deleted.has(archived.byNode.get(owner) ?? '')) return null
     if (owner) records.add(owner)
     return owner
   }
@@ -286,7 +292,7 @@ function planRecords(
   stylePositions(graph, records, orderKeys)
   const removed: GUID[] = []
   for (const [guid, nodeId] of archived.byGuid)
-    if (!graph.nodes.has(nodeId)) removed.push(stringToGuid(guid))
+    if (archived.deleted.has(guid) || !graph.nodes.has(nodeId)) removed.push(stringToGuid(guid))
   for (const guid of archived.dropped) removed.push(stringToGuid(guid))
   return { records, orderKeys, removed, replaceVariables }
 }
@@ -306,25 +312,18 @@ function editedComponents(
   return [...components]
 }
 
-/**
- * Instances on pages not loaded yet still carry the overrides and sizes derived from their
- * components as saved. Loading those pages lets the edits reach them, and their records follow.
- */
-async function loadComponentUsePages(
-  graph: SceneGraph,
+/** The pages whose instances use the edited components, as graph page IDs. */
+async function componentUsePages(
   archive: FigArchiveAccess,
-  changes: ArchiveChangeSummary,
+  components: string[],
   archived: ArchiveRecords
-): Promise<boolean> {
-  const components = editedComponents(graph, changes, archived)
-  if (components.length === 0) return false
-  let loaded = false
-  for (const pageGuid of await archive.componentPages(components)) {
-    const pageId = archived.byGuid.get(pageGuid)
-    if (pageId && isReaderPagePending(graph, pageId))
-      loaded = populateFigPage(graph, pageId) || loaded
-  }
-  return loaded
+): Promise<string[]> {
+  if (components.length === 0) return []
+  const guids = await archive.componentPages(components)
+  return guids.flatMap((guid) => {
+    const pageId = archived.byGuid.get(guid)
+    return pageId ? [pageId] : []
+  })
 }
 
 function writeRecords(setup: FigExportSetup, plan: RecordPlan): KiwiNodeChange[] | null {
@@ -523,15 +522,52 @@ export async function writePatchedFigFile(
   const changes = archiveChanges(source)
   const loaded = archiveRecords(source)
   if (!archive || !changes || !loaded) return null
-  // Pages loaded for the components add their records, so the map is read again after them.
-  const archived = (await loadComponentUsePages(source, archive, changes, loaded))
-    ? archiveRecords(source)
-    : loaded
-  if (!archived) return null
+  // An edited component's records reach the instances on the pages that use it. When one of
+  // those pages is still lazy, read it into an export-only copy: loading it in the live graph
+  // would materialize the archive there and publish those layers to the collaboration room.
+  const usePages = await componentUsePages(
+    archive,
+    editedComponents(source, changes, loaded),
+    loaded
+  )
+  let graph = source
+  let archived = loaded
+  if (usePages.some((pageId) => isReaderPagePending(source, pageId))) {
+    // The resumed reader may rebuild a deleted definition as an instance dependency. Keep
+    // the live document's deletions through that read so its scaffolding is never saved.
+    const associations = new Map(
+      [...loaded.byGuid].map(([guid, nodeId]) => [
+        guid,
+        { nodeId, deleted: !source.nodes.has(nodeId) }
+      ])
+    )
+    graph = cloneSceneGraphForFigExport(source)
+    if (!populateReaderExport(source, graph, usePages)) return null
+    copyArchiveChanges(
+      source,
+      graph,
+      [...graph.nodes.keys()].filter((id) => !source.nodes.has(id))
+    )
+    const expanded = archiveRecords(graph)
+    if (!expanded) return null
+    for (const [guid, nodeId] of expanded.byGuid)
+      if (!associations.get(guid)?.deleted && graph.nodes.has(nodeId))
+        associations.set(guid, { nodeId, deleted: false })
+    const byGuid = new Map([...associations].map(([guid, entry]) => [guid, entry.nodeId]))
+    const deleted = new Set(
+      [...associations].filter(([, entry]) => entry.deleted).map(([guid]) => guid)
+    )
+    archived = {
+      byGuid,
+      byNode: new Map([...byGuid].map(([guid, nodeId]) => [nodeId, guid])),
+      dropped: expanded.dropped,
+      deleted
+    }
+  }
   const info = await archive.info()
   let built: Awaited<ReturnType<typeof buildPatch>>
   try {
-    built = await buildPatch(source, runtime, info, changes, archived, options.withoutComments)
+    built = await buildPatch(graph, runtime, info, changes, archived, options.withoutComments)
   } catch (error) {
     if (error instanceof UnpatchableChangeError) return null
     throw error

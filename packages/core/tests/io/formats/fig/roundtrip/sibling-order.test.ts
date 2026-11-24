@@ -175,7 +175,8 @@ describe('loading pages keeps the order of sibling layers', () => {
     })
     const exported = await exportFigFile(graph)
     expect(lookups).toBe(1)
-    expect(isReaderPagePending(graph, pageNamed(graph, 'Used').id)).toBe(false)
+    // The save reads the instance page into an export copy, never into the live graph.
+    expect(isReaderPagePending(graph, pageNamed(graph, 'Used').id)).toBe(true)
     const edited = layersOf(graph, 'Library')
     expect(names(edited)).toEqual(['Footer', 'Badge', 'Header', 'Twin', 'Card', 'Twin'])
     const reopened = await open(exported)

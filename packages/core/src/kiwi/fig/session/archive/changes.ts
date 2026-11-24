@@ -171,6 +171,22 @@ export interface ArchiveBaseline {
   settings: SettingsSnapshot
 }
 
+/**
+ * Gives an export-only copy the edit accounting of the graph it came from, naming the layers it
+ * loaded after the edit as it would name layers loaded into the live graph.
+ */
+export function copyArchiveChanges(
+  source: SceneGraph,
+  target: SceneGraph,
+  loadedAfterEdits: Iterable<string> = []
+): void {
+  const entry = changes.get(source)
+  if (!entry) return
+  const copy = structuredClone(entry)
+  for (const id of loadedAfterEdits) copy.loadedAfterEdits.add(id)
+  changes.set(target, copy)
+}
+
 export function archiveBaseline(graph: SceneGraph): ArchiveBaseline | undefined {
   const entry = changes.get(graph)
   if (!entry) return undefined

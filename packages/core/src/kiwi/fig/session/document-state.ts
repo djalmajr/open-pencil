@@ -1,3 +1,5 @@
+import { partition } from 'es-toolkit'
+
 import {
   createFigDocumentSession,
   figCheckpointRecords,
@@ -143,7 +145,11 @@ export function hasPendingReaderPages(graph: SceneGraph): boolean {
   return !session || !session.pages.every((page) => session.loadedPageIds.has(page.id))
 }
 
-export function populateReaderExport(source: SceneGraph, target: SceneGraph): boolean {
+export function populateReaderExport(
+  source: SceneGraph,
+  target: SceneGraph,
+  pageIds?: readonly string[]
+): boolean {
   const state = states.get(source)
   if (!state || state.complete) return false
   const live = state.session
@@ -151,13 +157,26 @@ export function populateReaderExport(source: SceneGraph, target: SceneGraph): bo
   if (live?.pages.every((page) => live.loadedPageIds.has(page.id))) return false
   const checkpoint = live?.checkpoint() ?? state.checkpoint
   if (!checkpoint || !state.bytes) throw new Error('Missing reader checkpoint')
+  const [components, deleted] = partition(checkpoint.components, ([, { rootId }]) =>
+    target.nodes.has(rootId)
+  )
   const session = createFigDocumentSession(state.bytes, readerSessionOptions(state.diagnostics), {
     graph: target,
-    checkpoint
+    checkpoint: { ...checkpoint, components }
   })
-  // Export must include internal content too, not just the dependency closure needed
-  // for visible pages. Loading happens on the isolated target, never the live graph.
-  for (const page of session.pages) session.loadPage(page.id)
+  registerReaderSession(state.bytes, session, state.diagnostics)
+  // Full export needs internal content too. Incremental export only loads its use pages.
+  for (const page of session.pages) {
+    if (!pageIds || pageIds.includes(session.graphPageId(page.id) ?? '')) session.loadPage(page.id)
+  }
+  // The patch writer preserves the live deletions during the merge. The full writer
+  // serializes the clone, so refuse any definition that the page loads rebuilt.
+  if (pageIds === undefined) {
+    for (const [guid, { rootId }] of deleted) {
+      const layer = session.layerOf(guid)
+      if (layer && target.nodes.has(layer)) throw new Error(`Missing resumed component ${rootId}`)
+    }
+  }
   return true
 }
 

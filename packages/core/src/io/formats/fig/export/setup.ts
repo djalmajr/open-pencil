@@ -400,6 +400,8 @@ export interface FigExportSetup {
 export interface FigExportSetupOptions {
   /** Saved identities on pages that may not be loaded; new variable IDs must not claim them. */
   archiveRecordIds?: readonly string[]
+  /** Deleted component GUIDs that archived instances may still name. */
+  reservedGuids?: ReadonlySet<string>
   /** The first local ID a new GUID may take, above every GUID the target archive holds. */
   nextLocalId?: number
   /** The target archive's blobs, so the indices of new blobs follow theirs. */
@@ -436,7 +438,7 @@ export async function prepareFigExport(
 
   const pages = graph.getPages(true)
   const nodeIdToGuid = new Map<string, GUID>()
-  const assignedGuidValues = new Set<string>()
+  const assignedGuidValues = new Set(options.reservedGuids)
   // Reserve the document GUID to prevent imported nodes with source.id "0:0"
   // from reusing the document's own GUID slot.
   assignedGuidValues.add(`${docGuid.sessionID}:${docGuid.localID}`)
@@ -451,7 +453,7 @@ export async function prepareFigExport(
   // Before any canvas, variable or layer takes a counter GUID, so none collides.
   localIdCounter.value = Math.max(
     localIdCounter.value,
-    firstUnclaimedLocalId(graph, propertyIds),
+    firstUnclaimedLocalId(graph, [...propertyIds, ...(options.reservedGuids ?? [])]),
     options.nextLocalId ?? 0
   )
 

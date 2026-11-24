@@ -1,4 +1,10 @@
-import { bytesStream, readStreamBytes, renameFigArchive, streamFigArchive } from '@open-pencil/fig'
+import {
+  bytesStream,
+  readStreamBytes,
+  renameFigArchive,
+  streamFigArchive,
+  type FigSessionCheckpoint
+} from '@open-pencil/fig'
 import {
   nameImagesForFigma,
   placeSlotContent,
@@ -103,6 +109,28 @@ function appendInternalResources(context: InternalResourceContext): void {
   }
 }
 
+/** A saved instance can still name a deleted component, even on a page the patch never loads. */
+function deletedComponentGuids(
+  graph: SceneGraph,
+  checkpoint: FigSessionCheckpoint | undefined
+): ReadonlySet<string> {
+  const deleted = new Set<string>()
+  for (const [guid, { rootId }] of checkpoint?.components ?? []) {
+    const root = graph.getNode(rootId)
+    if (root?.type === 'COMPONENT' && (!root.source.id || root.source.id === guid)) continue
+    if (root)
+      throw new Error(`Missing resumed component ${guid}: its slot is occupied by ${rootId}`)
+    deleted.add(guid)
+  }
+  if (deleted.size === 0) return deleted
+  for (const { id, source } of graph.nodes.values()) {
+    const guid = deleted.has(id) ? id : source.id
+    if (guid && deleted.has(guid))
+      throw new Error(`Missing resumed component ${guid}: its GUID is already occupied by ${id}`)
+  }
+  return deleted
+}
+
 /**
  * `sourceGraph` as a `.fig`, written as the stream's reader asks for it. A document opened from an
  * archive and left unchanged is that archive, with only its `meta.json` renamed when
@@ -114,6 +142,7 @@ export async function exportFigFileStream(
   sourceGraph: SceneGraph,
   options: FigFileExtrasOptions = {}
 ): Promise<ReadableStream<Uint8Array>> {
+  const reservedGuids = deletedComponentGuids(sourceGraph, readerCheckpoint(sourceGraph))
   // An archive whose images Figma cannot read is written whole rather than reused.
   const reuseArchive = await archiveImagesNamedForFigma(sourceGraph)
   // The document's comments may be in the opened archive, and this write leaves them out.
@@ -134,7 +163,7 @@ export async function exportFigFileStream(
     options.ck,
     async (runtime) =>
       (reuseArchive ? await writePatchedFigFile(sourceGraph, runtime, options) : null) ??
-      writeFigFile(sourceGraph, runtime, options)
+      writeFigFile(sourceGraph, runtime, options, reservedGuids)
   )
 }
 
@@ -149,10 +178,10 @@ export async function exportFigFile(
 async function writeFigFile(
   sourceGraph: SceneGraph,
   runtime: FigNodeChangeExportRuntime,
-  options: FigFileExtrasOptions
+  options: FigFileExtrasOptions,
+  reservedGuids: ReadonlySet<string>
 ): Promise<ReadableStream<Uint8Array>> {
   await initCodec()
-  populateFigInternalPages(sourceGraph)
   // The export reads the document itself and writes nothing to it. Only pages still in the
   // archive need a copy, which they load into instead of the document.
   let graph = sourceGraph
@@ -160,8 +189,12 @@ async function writeFigFile(
     graph = cloneSceneGraphForFigExport(sourceGraph)
     populateReaderExport(sourceGraph, graph)
   }
+  // Internal pages are export-only scaffolding. Populate them after selecting the isolated
+  // graph, otherwise recovery/export can materialize them in the collaboration-owned graph.
+  populateFigInternalPages(graph)
   const setup = await prepareFigExport(graph, runtime, {
-    withoutComments: options.withoutComments
+    withoutComments: options.withoutComments,
+    reservedGuids
   })
   const { compiled, schemaDeflated } = exportSchema(graph)
   const { canvasEntries, internalCanvasGuid, localIdCounter, blobs } = setup
